@@ -1,0 +1,43 @@
+import {createClient} from '@supabase/supabase-js';
+import fs from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const f=JSON.parse(await fs.readFile(new URL('../.env.test-fixtures.json',import.meta.url),'utf8'));
+if(f.url!=='https://vqrkzjymfoinfeurwgtl.supabase.co')throw Error('Refusing to test outside isolated demo project');
+const results=[];
+const test=async(name,fn)=>{try{await fn();results.push({name,status:'PASS'});console.log('PASS '+name)}catch(e){results.push({name,status:'FAIL',error:e.message});console.log('FAIL '+name+': '+e.message)}};
+const ok=r=>{if(r.error)throw Error(r.error.message);return r.data};
+const client=()=>createClient(f.url,f.key,{auth:{persistSession:false,autoRefreshToken:false}});
+const anon=client(),users={};
+for(const u of f.users){const c=client();await test(u.name+' password login',async()=>{ok(await c.auth.signInWithPassword({email:u.email,password:u.password}));users[u.name.split(' ').at(-1)]=c;});}
+try{
+const {patient,patient2,doctor,admin}=users;
+const d=f.users.find(u=>u.role==='doctor').id;
+await test('Reset only demo doctor approval for repeatable tests',async()=>ok(await admin.from('profiles').update({approved:false}).eq('id',d))); 
+await test('Wrong password rejected',async()=>assert.ok((await anon.auth.signInWithPassword({email:f.users[0].email,password:'deliberately-wrong-password'})).error));
+await test('Patient cannot self-promote',async()=>assert.ok((await patient.from('profiles').update({role:'admin'}).eq('id',f.users[0].id)).error));
+await test('Doctor saves practice details',async()=>ok(await doctor.from('doctors').upsert({id:d,hospital_id:f.hospital,specialization:'General Medicine',bio:'TEST ONLY synthetic account'})));
+await test('Unapproved doctor cannot publish slots',async()=>assert.ok((await doctor.from('slots').insert({doctor_id:d,starts_at:new Date(Date.now()+86400000).toISOString()})).error));
+await test('Administrator sees pending doctor',async()=>assert.ok(ok(await admin.from('profiles').select('*,doctors(specialization,hospitals(name))').eq('role','doctor').eq('approved',false)).some(x=>x.id===d)));
+await test('Administrator approves doctor',async()=>assert.equal(ok(await admin.from('profiles').update({approved:true}).eq('id',d).select())[0].approved,true));
+let slot;
+await test('Approved doctor publishes future slot',async()=>{slot=ok(await doctor.from('slots').insert({doctor_id:d,starts_at:new Date(Date.now()+172800000).toISOString()}).select().single());});
+await test('Public sees approved doctor without patient data',async()=>{const list=ok(await anon.from('doctors').select('*,profiles(full_name,approved),hospitals(name,city)'));assert.ok(list.some(x=>x.id===d));assert.equal(ok(await anon.from('profiles').select('*')).filter(x=>x.role==='patient').length,0)});
+await test('Public availability includes free slot',async()=>assert.ok(ok(await anon.rpc('available_slots')).some(s=>s.id===slot.id)));
+let booking,winner,loser;
+await test('Concurrent booking permits exactly one patient',async()=>{const attempts=await Promise.all([patient,patient2].map(c=>c.from('appointments').insert({patient_id:c===patient?f.users[0].id:f.users[1].id,slot_id:slot.id,status:'requested'}).select().single()));assert.equal(attempts.filter(r=>!r.error).length,1);let n=attempts.findIndex(r=>!r.error);booking=attempts[n].data;winner=[patient,patient2][n];loser=[patient,patient2][1-n];});
+await test('Reserved slot disappears from public availability',async()=>assert.ok(!ok(await anon.rpc('available_slots')).some(s=>s.id===slot.id)));
+await test('Other patient cannot read appointment',async()=>assert.equal(ok(await loser.from('appointments').select('*').eq('id',booking.id)).length,0));
+await test('Patient dashboard includes requested appointment and doctor',async()=>{const a=ok(await winner.from('appointments').select('*,slots(*,doctors(*,profiles(full_name),hospitals(name,city)))').eq('id',booking.id).single());assert.equal(a.status,'requested');assert.ok(a.slots.doctors.profiles.full_name)});
+await test('Patient cannot confirm own request',async()=>assert.ok((await winner.from('appointments').update({status:'confirmed'}).eq('id',booking.id)).error));
+await test('Doctor dashboard sees request',async()=>assert.equal(ok(await doctor.from('appointments').select('*').eq('id',booking.id).single()).status,'requested'));
+await test('Doctor confirms request',async()=>assert.equal(ok(await doctor.from('appointments').update({status:'confirmed'}).eq('id',booking.id).select().single()).status,'confirmed'));
+await test('Patient sees confirmed appointment',async()=>assert.equal(ok(await winner.from('appointments').select('status').eq('id',booking.id).single()).status,'confirmed'));
+await test('Patient cancels appointment',async()=>assert.equal(ok(await winner.from('appointments').update({status:'cancelled'}).eq('id',booking.id).select().single()).status,'cancelled'));
+await test('Cancellation releases slot',async()=>assert.ok(ok(await anon.rpc('available_slots')).some(s=>s.id===slot.id)));
+await test('Cancelled request cannot be revived',async()=>assert.ok((await doctor.from('appointments').update({status:'confirmed'}).eq('id',booking.id)).error));
+await test('Slot with appointment history cannot be deleted',async()=>assert.ok((await doctor.from('slots').delete().eq('id',slot.id)).error));
+await test('Past appointment slot rejected',async()=>assert.ok((await doctor.from('slots').insert({doctor_id:d,starts_at:new Date(Date.now()-60000).toISOString()})).error));
+}catch(e){results.push({name:'Remaining suite',status:'BLOCKED',error:e.message});console.error(e.message)}
+await fs.writeFile(new URL('../appointment-test-results.json',import.meta.url),JSON.stringify({testedAt:new Date().toISOString(),project:'careway-demo-test',results},null,2));
+console.log(JSON.stringify({passed:results.filter(x=>x.status==='PASS').length,failed:results.filter(x=>x.status!=='PASS').length}));
+process.exitCode=results.some(x=>x.status!=='PASS')?1:0;
