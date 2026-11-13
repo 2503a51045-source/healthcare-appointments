@@ -9,3 +9,5 @@
 .form-actions{display:flex;align-items:center;gap:18px}.form-actions .text-button{font-size:11px}
 
 .approval-bio{max-width:580px;margin:9px 0;font-size:11px!important}
+
+.demo-banner{padding:12px 20px;background:#fff0ba;color:#352600;text-align:center;font-weight:700;font-size:13px;line-height:1.5;border-bottom:1px solid #d4b65c}
