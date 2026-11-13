@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.vercel/
+*.log
+public/hospitals.json.tmp
+scripts/overpass-live.json
